@@ -526,6 +526,67 @@ fn public_not_found() -> StoreError {
     StoreError::NotFound(PUBLIC_NOT_FOUND.to_owned())
 }
 
+
+/// Build one aggregate view from the latest successful serving projection. Every user is
+/// projected through the same compiler and live service-window check as an ordinary subscription.
+/// A user with no grant is naturally absent; any projection/runtime failure aborts the whole
+/// export so callers never receive a silently incomplete fleet.
+/// Build aggregate artifacts from the latest successful serving projection. Every user is
+/// projected through the same compiler and live service-window check as an ordinary subscription.
+/// Any projection/runtime failure aborts the whole export instead of silently omitting a user.
+pub async fn external_subscriptions(
+    pool: &PgPool,
+) -> Result<(u64, Vec<subscription::Subscription>)> {
+    let serving = crate::serving::load_subscription_serving_projection(pool).await?;
+    serving.ensure_available()?;
+    let snapshot = &serving.snapshot;
+    let output = crate::compile_cache::compile_incremental(snapshot);
+    let certificate_pins = crate::cert::self_signed_certificate_pins(pool).await?;
+    // Read the live service window once for the whole fleet. A per-user query here would turn a
+    // single subscription fetch into N database round trips and could observe different time
+    // boundaries while walking a large tenant list.
+    let active_users = sqlx::query_as::<_, (String, String)>(
+        "SELECT tenant_id, id FROM users
+         WHERE user_service_state(service_starts_at,service_expires_at,now())='active'",
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let mut subscriptions = Vec::new();
+
+    for user in &snapshot.users {
+        if !active_users.contains(&(user.tenant.clone(), user.id.clone())) {
+            continue;
+        }
+
+        let plan = crate::compile_cache::project_user(&output, &user.tenant, &user.id)
+            .map(|plan| plan.as_ref().clone())
+            .map_err(|blocked| StoreError::InvalidData(format!(
+                "cannot project user {}/{} for external export: {blocked:?}",
+                user.tenant, user.id
+            )))?;
+
+        if plan.entries.is_empty() {
+            let authorized = snapshot.apps.iter().any(|app| app.grants.iter().any(|grant| {
+                grant.tenant == user.tenant && grant.user == user.id
+            }));
+            if authorized {
+                return Err(StoreError::Unavailable(format!(
+                    "user {}/{} has grants but no currently usable subscription entries",
+                    user.tenant, user.id
+                )));
+            }
+            continue;
+        }
+
+        let mut artifact = subscription::build(&plan);
+        artifact.mark_self_signed(&certificate_pins);
+        subscriptions.push((snapshot.revision, artifact));
+    }
+    Ok((snapshot.revision, subscriptions.into_iter().map(|(_, artifact)| artifact).collect()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

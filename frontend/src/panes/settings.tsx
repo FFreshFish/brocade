@@ -19,6 +19,7 @@ import {
   fetchDistribution,
   fetchDeploymentSettings,
   fetchDataRetention,
+  fetchExternalApiStatus,
   fetchAgentLogPolicy,
   fetchHostNetworkTuning,
   fetchLinkMtu,
@@ -60,6 +61,7 @@ import {
   type DeploymentSettings,
   type DataRetentionPolicy,
   type DataRetentionView,
+  type ExternalApiStatus,
   type AgentLogLimits,
   type AgentLogLimitOverrides,
   type AgentLogPolicyNode,
@@ -344,6 +346,7 @@ const NAV: NavItem[] = [
   { id: 'set-vpngate', label: 'VPN Gate 能力', icon: 'tunnels' },
   { id: 'set-vpngate-intelligence', label: '情报任务', icon: 'observe' },
   { id: 'set-data-retention', label: '数据保留', icon: 'artifacts' },
+  { id: 'set-external-api', label: '外部 API', icon: 'protocol' },
 ];
 
 const ICON_OF: Record<string, IconName> = Object.fromEntries(NAV.map(item => [item.id, item.icon]));
@@ -2368,6 +2371,40 @@ export function DataRetentionSection({ editable, data }: { editable: boolean; da
   );
 }
 
+
+export function ExternalApiSection({ data }: { data: ExternalApiStatus }) {
+  const apiBase = `${data.base_url.replace(/\/+$/, '')}${data.base_path}`;
+  return (
+    <details className="panel config-panel" id="set-external-api">
+      <summary>
+        <SettingsTitle id="set-external-api">外部 API</SettingsTitle>
+      </summary>
+      <p className="cardsub">将当前已发布且仍在服务期内的全站用户节点汇总给外部订阅管理面板。JSON 返回结构化节点；Clash 与 URI 会在兼容性检查通过后输出。</p>
+      <Group label="接口状态">
+        <p className="settings-block-note">
+          {data.configured ? '访问令牌已配置，接口已启用。' : '尚未配置访问令牌，外部 API 当前关闭。'}
+        </p>
+        <p className="settings-block-note">接口地址：<code>{apiBase}/nodes</code></p>
+        <p className="settings-block-note">当前可用格式：{data.formats.join('、')}</p>
+        <p className="settings-block-note">外部接口运行在 Agent 公网入口。如果这里显示的是 127.0.0.1 或 localhost，需要先配置可从外网访问的 Agent 公网地址，再把上面的完整地址交给外部面板。</p>
+      </Group>
+      <Group label="服务器配置">
+        <p className="settings-block-note">
+          在 Brocade 服务进程的环境变量中配置 <code>BROCADE_EXTERNAL_API_TOKEN</code>，令牌长度至少 32 字节，最多 512 字节；配置后重启 Brocade 服务生效。令牌不会写入数据库，也不会返回给浏览器。
+        </p>
+        <pre className="settings-code"><code>{'openssl rand -hex 32'}</code></pre>
+        <p className="settings-block-note">将生成的 64 位十六进制随机字符串设置为 <code>BROCADE_EXTERNAL_API_TOKEN</code>。写入 Brocade 服务实际使用的 systemd 环境文件或服务覆盖配置，再重启对应服务；不要把令牌提交到 Git 仓库。</p>
+      </Group>
+      <Group label="调用示例">
+        <pre className="settings-code"><code>{'curl -H "Authorization: Bearer $BROCADE_EXTERNAL_API_TOKEN" "' + apiBase + '/nodes?format=json"'}</code></pre>
+        <pre className="settings-code"><code>{'curl -H "Authorization: Bearer $BROCADE_EXTERNAL_API_TOKEN" "' + apiBase + '/nodes?format=clash"'}</code></pre>
+        <pre className="settings-code"><code>{'curl -H "Authorization: Bearer $BROCADE_EXTERNAL_API_TOKEN" "' + apiBase + '/nodes?format=uri"'}</code></pre>
+        <p className="settings-block-note">健康检查：<code>{apiBase}/health</code>，同样需要 Bearer 令牌。URI 格式是逐用户完整转换后合并的多行 URI；若任一用户存在无法由 URI 表达的前置代理或自签证书，整次请求会返回兼容性错误。请通过 HTTPS 调用，并妥善保管令牌。</p>
+      </Group>
+    </details>
+  );
+}
+
 const HOST_GRO_MAX_NS = 1_000_000;
 const HOST_NAPI_DEFER_MAX = 64;
 
@@ -3472,6 +3509,11 @@ export function SettingsPane() {
     queryFn: fetchDataRetention,
     refetchInterval: 30_000,
   });
+  const externalApi = useQuery({
+    queryKey: ['external-api-status'],
+    queryFn: fetchExternalApiStatus,
+    enabled: who.role === 'system-admin',
+  });
   const hostNetworkTuning = useQuery({
     queryKey: ['host-network-tuning'],
     queryFn: fetchHostNetworkTuning,
@@ -4285,6 +4327,8 @@ export function SettingsPane() {
 
             {dataRetention.error && <ErrorBox error={dataRetention.error} />}
             {dataRetention.data && <DataRetentionSection editable={editable} data={dataRetention.data} />}
+            {editable && externalApi.error && <ErrorBox error={externalApi.error} />}
+            {editable && externalApi.data && <ExternalApiSection data={externalApi.data} />}
           </fieldset>
         </div>
       </div>

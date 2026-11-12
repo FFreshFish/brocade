@@ -4132,6 +4132,17 @@ export interface DataRetentionView {
   policies: DataRetentionPolicy[];
 }
 
+
+export interface ExternalApiStatus {
+  configured: boolean;
+  base_url: string;
+  base_path: string;
+  formats: string[];
+  authentication: string;
+}
+export const fetchExternalApiStatus = () =>
+  api<ExternalApiStatus>('/external-api/status', '', { cache: 'no-store' });
+
 export const fetchDataRetention = () => api<DataRetentionView>('/data-retention', '', { cache: 'no-store' });
 export const saveDataRetention = (tableName: string, ttlHours: number) =>
   api<DataRetentionView>(`/data-retention/${encodeURIComponent(tableName)}`, '', {

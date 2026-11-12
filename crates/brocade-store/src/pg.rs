@@ -1133,6 +1133,12 @@ impl PgStore {
         console::clash_subscription_for_user(&self.pool, actor, tenant_id, user_id).await
     }
 
+    pub async fn external_subscriptions(
+        &self,
+    ) -> Result<(u64, Vec<brocade_core::artifacts::subscription::Subscription>)> {
+        console::external_subscriptions(&self.pool).await
+    }
+
     pub async fn user_grant_probe_plan(
         &self,
         actor: &AdminContext,

@@ -1,3 +1,5 @@
+use serde::Serialize;
+
 use crate::{
     model::{
         AnyTls, ExternalOutboundProtocol, ExternalOutboundSecurity, FrontStrategy, Hysteria2,
@@ -6,7 +8,7 @@ use crate::{
     physical::user::{UserPlan, UserRealityPlan, UserSecurityPlan},
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Subscription {
     pub tenant: String,
     pub user: String,
@@ -15,7 +17,7 @@ pub struct Subscription {
     pub front_groups: Vec<SubscriptionFrontGroup>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SubscriptionExternalProxy {
     pub name: String,
     pub server: String,
@@ -24,7 +26,7 @@ pub struct SubscriptionExternalProxy {
     pub security: ExternalOutboundSecurity,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SubscriptionEntry {
     pub name: String,
     pub server: String,
@@ -39,7 +41,7 @@ pub struct SubscriptionEntry {
     pub front_name: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 pub enum SubscriptionStream {
     #[default]
     Tcp,
@@ -61,7 +63,7 @@ pub enum SubscriptionStream {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SubscriptionDownload {
     pub server: String,
     pub port: u16,
@@ -74,7 +76,7 @@ pub struct SubscriptionDownload {
 ///
 /// A client told the wrong one does not degrade — it fails outright, and in the TLS case it fails
 /// on the client's own certificate check before a byte reaches us.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum SubscriptionSecurity {
     VlessEncryption {
         public_key: String,
@@ -87,7 +89,7 @@ pub enum SubscriptionSecurity {
     MtProto,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SubscriptionAnyTls {
     pub server_name: String,
     pub settings: AnyTls,
@@ -96,7 +98,7 @@ pub struct SubscriptionAnyTls {
     pub certificate_fingerprint: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SubscriptionHysteria2 {
     pub server_name: String,
     pub settings: Hysteria2,
@@ -104,7 +106,7 @@ pub struct SubscriptionHysteria2 {
     pub certificate_fingerprint: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SubscriptionTls {
     pub server_name: String,
     pub flow: Option<String>,
@@ -112,7 +114,7 @@ pub struct SubscriptionTls {
     pub certificate_fingerprint: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SubscriptionReality {
     pub public_key: String,
     pub short_id: String,
@@ -121,7 +123,7 @@ pub struct SubscriptionReality {
     pub flow: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SubscriptionFrontGroup {
     pub name: String,
     pub strategy: FrontStrategy,

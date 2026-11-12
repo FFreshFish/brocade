@@ -1435,6 +1435,7 @@ fn admin_router_with_state(state: AppState) -> Router {
         // still require a system administrator in the handler below.
         .route("/branding", get(get_branding).put(update_branding))
         .route("/settings", get(get_settings).put(update_settings))
+        .route("/external-api/status", get(external_api_status))
         .route(
             "/deployment-settings",
             get(get_deployment_settings).put(update_deployment_settings),
@@ -2057,6 +2058,8 @@ fn agent_routes(state: AppState) -> Router<AppState> {
         .route("/brocade-agent/{arch}", get(agent_binary))
         .route("/brocade-xray/{arch}", get(xray_binary))
         .route("/sub/v1/{uuid}/clash.yaml", get(public_clash_subscription))
+        .route("/api/external/v1/nodes", get(external_api_nodes))
+        .route("/api/external/v1/health", get(external_api_health))
         .route(
             "/sub/v1/haitun/{token}/clash.yaml",
             get(public_haitun_clash_subscription),
@@ -2249,6 +2252,277 @@ async fn console_version() -> Response {
         .headers_mut()
         .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
     response
+}
+
+
+#[derive(Debug, Default, Deserialize)]
+struct ExternalApiQuery {
+    format: Option<String>,
+}
+
+/// Bearer credentials use the RFC 6750 b64token character set. Requiring a printable,
+/// header-safe value keeps the UI's configured state aligned with what an HTTP client can send.
+fn valid_external_api_token(token: &str) -> bool {
+    (32..=512).contains(&token.len())
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-._~+/=".contains(&byte))
+}
+
+/// This key is process configuration, not model or database state. Hashing both values to fixed
+/// length before constant-time comparison also avoids leaking a length-dependent comparison.
+fn external_api_token_matches(headers: &HeaderMap) -> bool {
+    let Ok(expected) = env::var("BROCADE_EXTERNAL_API_TOKEN") else {
+        return false;
+    };
+    if !valid_external_api_token(&expected) {
+        return false;
+    }
+    let Some(candidate) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+    else {
+        return false;
+    };
+    let expected: [u8; 32] = Sha256::digest(expected.as_bytes()).into();
+    let candidate: [u8; 32] = Sha256::digest(candidate.as_bytes()).into();
+    bool::from(expected.ct_eq(&candidate))
+}
+
+async fn external_api_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let _admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    let configured = env::var("BROCADE_EXTERNAL_API_TOKEN")
+        .ok()
+        .is_some_and(|token| valid_external_api_token(&token));
+    let agent_origin = state
+        .distribution()
+        .await?
+        .agent_public_url
+        .trim_end_matches('/')
+        .to_owned();
+    Ok(no_store_json(json!({
+        "configured": configured,
+        "base_url": agent_origin,
+        "base_path": "/api/external/v1",
+        "formats": ["json", "clash", "uri"],
+        "authentication": "Authorization: Bearer <BROCADE_EXTERNAL_API_TOKEN>",
+    })))
+}
+
+async fn external_api_health(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    // Count failed attempts too: limiting only after authentication would leave the bearer
+    // comparison endpoint open to unbounded online guessing.
+    if !subscription_rate_allowed(&state, &headers, "external-api") {
+        let mut response = (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error":"too many requests"}))).into_response();
+        response.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+        return subscription_no_store(response);
+    }
+    if !external_api_token_matches(&headers) {
+        return subscription_no_store(
+            (StatusCode::UNAUTHORIZED, Json(json!({"error":"unauthorized"}))).into_response()
+        );
+    }
+    subscription_no_store(Json(json!({"ok":true})).into_response())
+}
+
+fn external_api_text_response(body: String, content_type: &'static str) -> Response {
+    let mut response = body.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(content_type),
+    );
+    subscription_no_store(response)
+}
+
+/// Stable opaque namespace for one tenant/user pair. The merged config must keep names unique
+/// across users without publishing internal tenant or user identifiers in node labels.
+fn external_fleet_name_prefix(tenant: &str, user: &str) -> String {
+    let identity = format!("{tenant}\0{user}");
+    let digest = sha256_hex(identity.as_bytes());
+    format!("fleet-{}:", &digest[..16])
+}
+
+/// Give every fleet resource a stable opaque namespace before merging. Mihomo references
+/// front groups and external proxies by name, so rename both definitions and every reference.
+fn merge_external_clash_artifacts(
+    revision: u64,
+    subscriptions: Vec<brocade_core::artifacts::subscription::Subscription>,
+) -> std::result::Result<(u64, String), String> {
+    use brocade_core::artifacts::subscription::{Subscription, SubscriptionSecurity};
+    let mut merged = Subscription {
+        tenant: "all".to_owned(),
+        user: "all".to_owned(),
+        entries: Vec::new(),
+        external_proxies: Vec::new(),
+        front_groups: Vec::new(),
+    };
+
+    for mut artifact in subscriptions {
+        if artifact.entries.iter().any(|entry| matches!(&entry.security, SubscriptionSecurity::MtProto)) {
+            return Err("Clash/Mihomo does not support MTProto; export refused to avoid omitting nodes".to_owned());
+        }
+
+        let prefix = external_fleet_name_prefix(&artifact.tenant, &artifact.user);
+        let mut resource_names = HashMap::new();
+        for (index, entry) in artifact.entries.iter_mut().enumerate() {
+            let old = entry.name.clone();
+            let new = format!("{prefix}node:{index}:{old}");
+            if resource_names.insert(old.clone(), new.clone()).is_some() {
+                return Err(format!("ambiguous resource name {old:?} for {prefix}"));
+            }
+            entry.name = new;
+        }
+        for (index, proxy) in artifact.external_proxies.iter_mut().enumerate() {
+            let old = proxy.name.clone();
+            let new = format!("{prefix}proxy:{index}:{old}");
+            if resource_names.insert(old.clone(), new.clone()).is_some() {
+                return Err(format!("ambiguous resource name {old:?} for {prefix}"));
+            }
+            proxy.name = new;
+        }
+
+        let mut front_names = HashMap::new();
+        for (index, group) in artifact.front_groups.iter_mut().enumerate() {
+            let old = group.name.clone();
+            let new = format!("{prefix}front:{index}:{old}");
+            if front_names.insert(old.clone(), new.clone()).is_some() {
+                return Err(format!("ambiguous front-group name {old:?} for {prefix}"));
+            }
+            group.name = new;
+        }
+        for entry in &mut artifact.entries {
+            if let Some(front) = entry.front_name.clone() {
+                let renamed = front_names.get(&front).cloned().ok_or_else(|| {
+                    format!("entry {:?} references missing front group {front:?}", entry.name)
+                })?;
+                entry.front_name = Some(renamed);
+            }
+        }
+        for group in &mut artifact.front_groups {
+            for member in &mut group.members {
+                let resource = resource_names.get(member);
+                let front = front_names.get(member);
+                *member = match (resource, front) {
+                    (Some(_), Some(_)) => {
+                        return Err(format!("ambiguous front-group member reference {member:?}"));
+                    }
+                    (Some(name), None) | (None, Some(name)) => name.clone(),
+                    (None, None) => {
+                        return Err(format!("front group references missing member {member:?}"));
+                    }
+                };
+            }
+        }
+
+        merged.entries.extend(artifact.entries);
+        merged.external_proxies.extend(artifact.external_proxies);
+        merged.front_groups.extend(artifact.front_groups);
+    }
+
+    if merged.entries.is_empty() {
+        return Err("there are no active subscription nodes to export".to_owned());
+    }
+    Ok((revision, brocade_core::format::yaml::clash_subscription(&merged)))
+}
+
+/// URI subscriptions cannot express front-proxy routing or trust a self-signed certificate
+/// pin. Validate every user's complete artifact before returning any bytes; never concatenate a
+/// partial list that silently drops the users whose entries cannot be represented.
+fn merge_external_uri_artifacts(
+    subscriptions: Vec<brocade_core::artifacts::subscription::Subscription>,
+) -> std::result::Result<String, String> {
+    let mut content = Vec::new();
+    for artifact in subscriptions {
+        match brocade_core::format::uri::complete_subscription(&artifact) {
+            Ok(value) => content.push(value.trim().to_owned()),
+            Err(reason) => {
+                return Err(format!(
+                    "URI export cannot represent every active node: {reason:?}"
+                ));
+            }
+        }
+    }
+    if content.is_empty() {
+        return Err("there are no active subscription nodes to export".to_owned());
+    }
+    Ok(content.join("\n"))
+}
+
+async fn external_api_nodes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ExternalApiQuery>,
+) -> Response {
+    // Rate-limit before checking the bearer so invalid credentials are throttled as well.
+    if !subscription_rate_allowed(&state, &headers, "external-api") {
+        let mut response = (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error":"too many requests"}))).into_response();
+        response.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+        return subscription_no_store(response);
+    }
+    if !external_api_token_matches(&headers) {
+        return subscription_no_store(
+            (StatusCode::UNAUTHORIZED, Json(json!({"error":"unauthorized"}))).into_response()
+        );
+    }
+
+    let format = query.format.as_deref().unwrap_or("json");
+    if !matches!(format, "json" | "clash" | "uri") {
+        return subscription_no_store(
+            (StatusCode::NOT_ACCEPTABLE, Json(json!({
+                "error":"unsupported_format",
+                "supported_formats":["json","clash","uri"]
+            }))).into_response()
+        );
+    }
+
+    match state.store.external_subscriptions().await {
+        Ok((revision, subscriptions)) if format == "json" => {
+            let users = subscriptions.into_iter().map(|artifact| json!({
+                "tenant_id": artifact.tenant,
+                "user_id": artifact.user,
+                "revision": revision,
+                "nodes": artifact.entries,
+                "external_proxies": artifact.external_proxies,
+                "front_groups": artifact.front_groups,
+            })).collect::<Vec<_>>();
+            subscription_no_store(Json(json!({
+                "format":"json",
+                "revision":revision,
+                "users":users
+            })).into_response())
+        }
+        Ok((revision, subscriptions)) if format == "clash" => {
+            match merge_external_clash_artifacts(revision, subscriptions) {
+                Ok((_, content)) => external_api_text_response(content, "text/yaml; charset=utf-8"),
+                Err(reason) => subscription_no_store(
+                    (StatusCode::NOT_ACCEPTABLE, Json(json!({
+                        "error":"incompatible_nodes",
+                        "detail":reason
+                    }))).into_response()
+                ),
+            }
+        }
+        Ok((_, subscriptions)) if format == "uri" => {
+            match merge_external_uri_artifacts(subscriptions) {
+                Ok(content) => external_api_text_response(content, "text/plain; charset=utf-8"),
+                Err(reason) => subscription_no_store(
+                    (StatusCode::NOT_ACCEPTABLE, Json(json!({
+                        "error":"incompatible_nodes",
+                        "detail":reason
+                    }))).into_response()
+                ),
+            }
+        }
+        Ok(_) => unreachable!("supported formats handled above"),
+        Err(error) => subscription_no_store(ApiError::Store(error).into_response()),
+    }
 }
 
 async fn public_clash_subscription(
@@ -12423,5 +12697,132 @@ mod tests {
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 
         std::fs::remove_dir_all(&dist).ok();
+    }
+}
+
+
+#[cfg(test)]
+mod external_api_tests {
+    use super::{merge_external_clash_artifacts, merge_external_uri_artifacts};
+    use brocade_core::artifacts::subscription::{
+        Subscription, SubscriptionEntry, SubscriptionSecurity, SubscriptionStream, SubscriptionTls,
+    };
+
+    fn artifact(tenant: &str, user: &str, name: &str) -> Subscription {
+        Subscription {
+            tenant: tenant.to_owned(),
+            user: user.to_owned(),
+            entries: vec![SubscriptionEntry {
+                name: name.to_owned(),
+                server: "node.example".to_owned(),
+                port: 443,
+                uuid: format!("{tenant}-{user}-uuid"),
+                security: SubscriptionSecurity::Tls(SubscriptionTls {
+                    server_name: "node.example".to_owned(),
+                    flow: None,
+                    self_signed: false,
+                    certificate_fingerprint: None,
+                }),
+                stream: SubscriptionStream::Tcp,
+                front_name: None,
+            }],
+            external_proxies: Vec::new(),
+            front_groups: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn clash_fleet_export_keeps_duplicate_node_names_distinct() {
+        let (revision, content) = merge_external_clash_artifacts(12, vec![
+            artifact("tenant-a", "alice", "Tokyo"),
+            artifact("tenant-b", "bob", "Tokyo"),
+        ])
+        .unwrap();
+
+        assert_eq!(revision, 12);
+        assert!(content.contains(&format!("{}node:0:Tokyo", super::external_fleet_name_prefix("tenant-a", "alice"))));
+        assert!(content.contains(&format!("{}node:0:Tokyo", super::external_fleet_name_prefix("tenant-b", "bob"))));
+        assert!(!content.contains("tenant-a"));
+        assert!(!content.contains("alice"));
+        assert_eq!(content.matches("type: vless").count(), 2);
+    }
+
+    #[test]
+    fn uri_fleet_export_refuses_the_whole_list_when_one_user_needs_a_front_proxy() {
+        let valid = artifact("tenant-a", "alice", "Direct");
+        let mut incompatible = artifact("tenant-b", "bob", "Relayed");
+        incompatible.entries[0].front_name = Some("front".to_owned());
+        incompatible.front_groups.push(brocade_core::artifacts::subscription::SubscriptionFrontGroup {
+            name: "front".to_owned(),
+            strategy: brocade_core::model::FrontStrategy::Select,
+            members: vec!["Relayed".to_owned()],
+        });
+        let error = merge_external_uri_artifacts(vec![valid, incompatible]).unwrap_err();
+        assert!(error.contains("FrontProxy"));
+    }
+
+    #[test]
+    fn uri_fleet_export_refuses_self_signed_tls_instead_of_emitting_an_untrusted_link() {
+        let mut incompatible = artifact("tenant-a", "alice", "Self signed");
+        if let SubscriptionSecurity::Tls(tls) = &mut incompatible.entries[0].security {
+            tls.self_signed = true;
+        }
+        let error = merge_external_uri_artifacts(vec![incompatible]).unwrap_err();
+        assert!(error.contains("SelfSignedCertificate"));
+    }
+
+    #[test]
+    fn clash_fleet_export_renames_front_group_and_entry_references_together() {
+        let mut value = artifact("tenant-a", "alice", "Tokyo");
+        value.entries[0].front_name = Some("front".to_owned());
+        value.front_groups.push(brocade_core::artifacts::subscription::SubscriptionFrontGroup {
+            name: "front".to_owned(),
+            strategy: brocade_core::model::FrontStrategy::Select,
+            members: vec!["Tokyo".to_owned()],
+        });
+        let (_, content) = merge_external_clash_artifacts(7, vec![value]).unwrap();
+        let prefix = super::external_fleet_name_prefix("tenant-a", "alice");
+        assert!(content.contains(&format!("dialer-proxy: \"{prefix}front:0:front\"")));
+        assert!(content.contains(&format!("proxies: [\"{prefix}node:0:Tokyo\"]")));
+    }
+
+    #[test]
+    fn external_api_token_validation_matches_http_bearer_constraints() {
+        assert!(super::valid_external_api_token(&"a".repeat(32)));
+        assert!(super::valid_external_api_token(&"f".repeat(512)));
+        assert!(!super::valid_external_api_token(&"a".repeat(31)));
+        assert!(!super::valid_external_api_token(&"a".repeat(513)));
+        assert!(!super::valid_external_api_token("contains spaces and is long enough"));
+        assert!(!super::valid_external_api_token(&format!("{}\n", "a".repeat(32))));
+    }
+
+    #[test]
+    fn clash_and_uri_fleet_exports_refuse_empty_fleets() {
+        assert!(merge_external_clash_artifacts(4, Vec::new())
+            .unwrap_err()
+            .contains("no active subscription nodes"));
+        assert!(merge_external_uri_artifacts(Vec::new())
+            .unwrap_err()
+            .contains("no active subscription nodes"));
+    }
+
+    #[test]
+    fn clash_fleet_export_refuses_unresolved_front_group_references() {
+        let mut value = artifact("tenant-a", "alice", "Tokyo");
+        value.front_groups.push(brocade_core::artifacts::subscription::SubscriptionFrontGroup {
+            name: "front".to_owned(),
+            strategy: brocade_core::model::FrontStrategy::Select,
+            members: vec!["missing-node".to_owned()],
+        });
+        let error = merge_external_clash_artifacts(3, vec![value]).unwrap_err();
+        assert!(error.contains("missing member"));
+    }
+
+    #[test]
+    fn clash_fleet_export_refuses_mtproto_instead_of_dropping_it() {
+        let mut unsupported = artifact("tenant-a", "alice", "Telegram");
+        unsupported.entries[0].security = SubscriptionSecurity::MtProto;
+        let error = merge_external_clash_artifacts(1, vec![unsupported]).unwrap_err();
+        assert!(error.contains("MTProto"));
     }
 }
